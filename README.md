@@ -44,8 +44,12 @@ from these docs alone.**
   level on each context type; the server maps its RBAC to levels.
 - **Sessionless:** no login/handshake/session — every request is authenticated and
   authorized from its bearer token, and the sync cursor is client‑owned.
+- **Hierarchical context types:** types form a **tree**, not a flat list. The manifest
+  declares tier‑1 **base categories** (the "life primitives" roots — `person`, `place`,
+  `thing`, `event`, `task`, `goal`), and each type places itself via `baseCategory`
+  (its root) and optional `parent` (a more‑specific subtype). Depth = specificity.
 - **Four skills:**
-  - `cfx3.manifest` — the context types the caller may read + the caller's level on each.
+  - `cfx3.manifest` — the context‑type **tree** (base categories + types the caller may read) + the caller's level on each.
   - `cfx3.permissions` — the **calling principal's** subject + per‑type level map
     (the "who am I / what can I do" call).
   - `cfx3.sync` — **read** context; full (`since: null`) or incremental (`since: <ISO>`).

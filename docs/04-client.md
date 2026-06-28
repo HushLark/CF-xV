@@ -90,8 +90,22 @@ function refreshManifest(source):
 
 - Refresh on connect, then periodically (e.g. daily) or on demand.
 - `ensureLocalTypes` maps each `Cfx3TypeDef` to your store's notion of a type
-  (name, fields, `baseCategory` hint), creating it if absent. Do this **before**
-  ingesting nodes so they validate.
+  (name, fields, **`baseCategory`** root, **`parent`** subtype link), creating it if
+  absent. Do this **before** ingesting nodes so they validate.
+- **Preserve the hierarchy** (spec §3.2.2): first map `manifest.base_categories` to
+  your tier‑1 roots (or your own ontology), then create each type under its `parent`
+  (if set) else its `baseCategory`. A type's depth below the root is its specificity —
+  keep it, so a more‑specific subtype can outrank a generic one in your ranking.
+
+```
+function ensureLocalTypes(manifest):
+    for c in manifest.base_categories:
+        ensureBaseCategory(c.id, c.label)            # map to your roots (or reuse existing)
+    # create parents before children so `parent` resolves; topo-sort or 2 passes
+    for t in topoSortByParent(manifest.context_types):
+        ensureType({ name:t.name, plural:t.plural, fields:t.fields,
+                     baseCategory:t.baseCategory, parent:t.parent })
+```
 
 ## 5. Sync: read with a client‑owned cursor
 

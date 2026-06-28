@@ -29,8 +29,9 @@ integration each time.
 CF/x3 (Context Federation) is a small protocol for exactly that. A **client**
 connects to one or more **sources** and:
 
-- **discovers** what context a source offers (its *context types*) and what it may
-  do with them (read / write / delete) — the **manifest**;
+- **discovers** what context a source offers — its *context types*, organized as a
+  **tree** rooted in tier‑1 *base categories* (the "life primitives") — and what it
+  may do with them (read / write / delete) — the **manifest**;
 - **reads** context in bulk, either a full snapshot or only what changed since the
   last sync — **sync**;
 - **mirrors** those records into its own store, **tagged with the originating

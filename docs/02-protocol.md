@@ -232,10 +232,14 @@ Describes a context type the source exposes.
 
 ```ts
 interface Cfx3TypeDef {
-  name: string;          // REQUIRED. e.g. "company"
+  name: string;          // REQUIRED. unique type id within the source, e.g. "company"
   plural?: string;       // e.g. "companies"
   description?: string;
-  baseCategory?: string; // optional ontology hint: person|place|thing|event|task|goal
+  baseCategory?: string; // REQUIRED for a root-tier type: the id of a base category
+                         // (§3.2.1) this type ultimately rolls up to. Omit only when
+                         // `parent` is set (the ancestry is then inherited).
+  parent?: string;       // optional. the `name` of a MORE-GENERAL context type this
+                         // one specializes (subtype-of). Forms the type tree (§3.2.2).
   fields?: Cfx3FieldDef[];
   level?: number;        // in MANIFEST responses: the caller's access level for this
                          // type, 0–4 (none|read|update|create|delete). Types at level 0
@@ -252,8 +256,49 @@ interface Cfx3FieldDef {
 }
 ```
 
-`baseCategory` is an optional hint to help consumers slot the type into their own
-ontology; consumers MAY ignore it.
+A type declares its position in the hierarchy with **`baseCategory`** (its tier‑1
+root) and/or **`parent`** (a more-specific parent type). See §3.2.2.
+
+#### 3.2.1 Base category — `Cfx3BaseCategory` (tier 1)
+
+Context types are not a flat list: they form a **tree** rooted in a small, stable
+set of **base categories** — the top tier of the ontology. (In Phaibel's domain
+these are the six *life primitives* a person's world is made of: `person`, `place`,
+`thing`, `event`, `task`, `goal`. A source MAY declare a different root set, but
+SHOULD keep it small and stable.)
+
+```ts
+interface Cfx3BaseCategory {
+  id: string;          // REQUIRED. stable id referenced by Cfx3TypeDef.baseCategory, e.g. "person"
+  label: string;       // REQUIRED. display name, e.g. "Person"
+  description?: string;
+}
+```
+
+Base categories are the **abstract roots** of the tree — they organize types; nodes
+are synced into concrete `context_types`, not directly into a base category.
+
+#### 3.2.2 The context‑type hierarchy
+
+Every context type resolves to exactly one base category, giving a multi‑tier tree:
+
+- **Tier 1 — base categories** (`manifest.base_categories`): the roots.
+- **Tier 2 — root types**: a `Cfx3TypeDef` with **no `parent`**; it attaches directly
+  to its `baseCategory`.
+- **Tier 3+ — subtypes**: a `Cfx3TypeDef` whose `parent` names another type. It
+  *inherits* that parent's base‑category ancestry (so `baseCategory` MAY be omitted on
+  a subtype; if present it MUST agree with the resolved root).
+
+A receiver reconstructs the tree by: for each type, attach under `parent` if set,
+else under `baseCategory`; roots are the `base_categories`. The **depth** below the
+base category is the type's *specificity* — a more‑specific subtype (e.g.
+`enterprise-customer` → `customer` → `thing`) is a stronger signal than a generic one.
+
+Rules:
+- `parent` MUST reference a `name` present in the same manifest's `context_types`
+  (no dangling parents); cycles are invalid.
+- A type with neither `parent` nor `baseCategory` is malformed; receivers SHOULD
+  treat it as a tier‑2 type under an implicit/unknown root and MAY warn.
 
 ### 3.3 Permissions — `Cfx3Permissions`
 
@@ -277,18 +322,25 @@ A `types` entry of `0` (or an absent entry) means no access to that type.
 
 ```ts
 interface Cfx3Manifest {
-  cfx3_version: number;          // protocol version (1)
-  source: string;               // stable source id, e.g. "synaptic"
-  name: string;                 // display name
-  context_types: Cfx3TypeDef[];  // only types the caller can read (level ≥ 1), each with `level`
-  manageTypes: boolean;          // whether the caller may manage context types
+  cfx3_version: number;             // protocol version (1)
+  source: string;                  // stable source id, e.g. "synaptic"
+  name: string;                    // display name
+  base_categories: Cfx3BaseCategory[]; // tier-1 roots of the type tree (§3.2.1)
+  context_types: Cfx3TypeDef[];     // the types, each with baseCategory and/or parent
+                                    // forming a tree (§3.2.2); only types the caller can
+                                    // read (level ≥ 1), each annotated with `level`
+  manageTypes: boolean;             // whether the caller may manage context types
   auth: { schemes: ("bearer")[] };
 }
 ```
 
-The manifest is **permission‑scoped to the caller**: it lists only types the caller
-may read (level ≥ 1) and annotates each with the caller's `level`. `cfx3.permissions`
-returns the same per‑type levels in a compact map (§4.5).
+The manifest **describes the source's context‑type tree**: `base_categories` are the
+roots (tier 1) and each `Cfx3TypeDef` declares its place via `baseCategory`/`parent`
+(§3.2.2). It is also **permission‑scoped to the caller**: it lists only types the
+caller may read (level ≥ 1) and annotates each with the caller's `level`. When
+permission scoping hides a parent type, its visible subtypes fall back to their
+resolved `baseCategory` root. `cfx3.permissions` returns the same per‑type levels in a
+compact map (§4.5).
 
 ---
 
@@ -585,11 +637,23 @@ Result (artifact data):
   "cfx3_version": 1,
   "source": "synaptic",
   "name": "Synaptic",
+  "base_categories": [
+    { "id": "person", "label": "Person" },
+    { "id": "place",  "label": "Place" },
+    { "id": "thing",  "label": "Thing" },
+    { "id": "event",  "label": "Event" },
+    { "id": "task",   "label": "Task" },
+    { "id": "goal",   "label": "Goal" }
+  ],
   "context_types": [
     { "name": "company", "plural": "companies", "baseCategory": "place", "level": 4,
       "fields": [ { "key": "domain", "type": "string" }, { "key": "industry", "type": "string" } ] },
     { "name": "contact", "plural": "contacts", "baseCategory": "person", "level": 2,
       "fields": [ { "key": "email", "type": "string" }, { "key": "role", "type": "string" } ] },
+    { "name": "customer", "plural": "customers", "baseCategory": "thing", "level": 1,
+      "fields": [ { "key": "billingEmail", "type": "string" } ] },
+    { "name": "enterprise-customer", "plural": "enterprise customers", "parent": "customer", "level": 1,
+      "fields": [ { "key": "seats", "type": "number" } ] },
     { "name": "account", "plural": "accounts", "baseCategory": "thing", "level": 1,
       "fields": [ { "key": "code", "type": "string" } ] }
   ],
@@ -598,8 +662,19 @@ Result (artifact data):
 }
 ```
 
-Here the caller may delete companies (4), update contacts (2), and only read accounts
-(1). Any type they can't read (level 0) is absent.
+The tree this describes:
+
+```
+place ──▶ company
+person ─▶ contact
+thing ──▶ customer ──▶ enterprise-customer   (subtype via parent)
+         ▶ account
+```
+
+`enterprise-customer` omits `baseCategory` — it inherits `thing` through its `parent`
+`customer`, and is one tier more specific. Permission‑wise the caller may delete
+companies (4), update contacts (2), and only read customers/accounts (1). Any type
+they can't read (level 0) is absent.
 
 ### 10.2 Permissions (who am I)
 
@@ -693,7 +768,9 @@ A rejected write — a JSON‑RPC **error** response carrying an RFC 9457 proble
 - [ ] Authenticates the **bearer token per request** (sessionless), on **every**
       skill including `cfx3.manifest`.
 - [ ] Maps internal roles → a **per‑type level (0–4)**; enforces the op's required level.
-- [ ] `cfx3.manifest` returns only types with level ≥ 1, each annotated with `level`.
+- [ ] `cfx3.manifest` returns `base_categories` (tier‑1 roots) and the context‑type
+      tree (each type with `baseCategory` and/or `parent`); only types with level ≥ 1,
+      each annotated with `level`; no dangling `parent` references.
 - [ ] `cfx3.permissions` returns the caller's `subject`, `manageTypes`, and `types` level map.
 - [ ] `cfx3.sync` supports full (`since:null`) and incremental; returns `records`,
       `tombstones`, `syncedAt`; keeps **no cursor state**.
@@ -703,7 +780,8 @@ A rejected write — a JSON‑RPC **error** response carrying an RFC 9457 proble
 
 **Client**
 - [ ] Sends `Authorization: Bearer` on every call; assumes no session.
-- [ ] Fetches + caches the manifest and `cfx3.permissions`; ensures local types exist.
+- [ ] Fetches + caches the manifest and `cfx3.permissions`; ensures local types exist,
+      preserving the hierarchy (`base_categories` roots + each type's `baseCategory`/`parent`).
 - [ ] Gates each operation on the type's `level` (read ≥1, update ≥2, create ≥3, delete ≥4).
 - [ ] Sends `since` cursor; persists returned `syncedAt`; supports paging.
 - [ ] Upserts keyed on `(source, uid)`; records provenance; applies tombstones.

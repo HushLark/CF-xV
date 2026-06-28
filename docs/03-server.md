@@ -22,14 +22,21 @@ Map your entities to **context types** and each row/record to a **context node**
   can't mutate simply has a max **level** of `1` (read) for that caller (§7).
 - Use **`links`** for relationships, with `target` set to another node's `uid`
   (e.g. a contact links `works-at` → `crm/company/CO123`).
+- **Organize your types into a tree** (spec §3.2.2). Declare a small, stable set of
+  tier‑1 **base categories** (the roots — e.g. the life primitives `person`, `place`,
+  `thing`, `event`, `task`, `goal`), then give each type a `baseCategory` (its root)
+  and, for a specialization, a `parent` (the more‑general type it refines). Keep base
+  categories few and stable; express richness as deeper subtypes.
 
 Example mapping (a CRM):
 
-| Your table | Context type | uid | fields |
-|------------|-------------|-----|--------|
-| companies | `company` | `crm/company/{id}` | domain, industry, city, … |
-| contacts | `contact` | `crm/contact/{id}` | email, role, … (+ link to company) |
-| ledger accounts | `account` (read‑only → level 1) | `acc/account/{id}` | code, type, … |
+| Your table | Context type | base / parent | uid | fields |
+|------------|-------------|---------------|-----|--------|
+| companies | `company` | base `place` | `crm/company/{id}` | domain, industry, city, … |
+| contacts | `contact` | base `person` | `crm/contact/{id}` | email, role, … (+ link to company) |
+| customers | `customer` | base `thing` | `sub/customer/{id}` | billingEmail, … |
+| enterprise customers | `enterprise-customer` | parent `customer` | `sub/customer/{id}` | seats, … |
+| ledger accounts | `account` (read‑only → level 1) | base `thing` | `acc/account/{id}` | code, type, … |
 
 ## 2. Serve the agent card
 
@@ -111,16 +118,32 @@ Require a valid token (401 otherwise). Return only types the caller can **read**
 (level ≥ 1), each annotated with the caller's `level`:
 
 ```
+BASE_CATEGORIES = [                          # tier-1 roots (the "life primitives")
+  { id:"person", label:"Person" }, { id:"place", label:"Place" },
+  { id:"thing",  label:"Thing"  }, { id:"event", label:"Event" },
+  { id:"task",   label:"Task"   }, { id:"goal",  label:"Goal"  } ]
+
 buildManifest(levels) =
   { cfx3_version: 1,
     source: "<your-source-id>",
     name:   "<display name>",
+    base_categories: BASE_CATEGORIES,        # the roots of the type tree
     context_types: TYPES
         .filter(t => levels[t.name] >= 1)
-        .map(t => ({ ...stripInternalFields(t), level: levels[t.name] })),
+        # keep each type's baseCategory and/or parent so the client rebuilds the tree
+        .map(t => ({ ...stripInternalFields(t), baseCategory: t.baseCategory,
+                     parent: t.parent, level: levels[t.name] })),
     manageTypes: principalCanManageTypes,    # usually false (code-defined types)
     auth: { schemes: ["bearer"] } }
 ```
+
+Hierarchy tips:
+- Emit `base_categories` once; reference an `id` from each type's `baseCategory`.
+- A subtype sets `parent` (another type's `name`); it inherits the parent's root, so
+  `baseCategory` may be omitted on subtypes.
+- Don't emit a `parent` that points at a type the caller can't read (level 0) — that
+  parent is filtered out. Either drop the `parent` (let the subtype fall back to its
+  `baseCategory`) or keep the chain readable.
 
 ## 4a. `cfx3.permissions`
 
