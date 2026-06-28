@@ -36,7 +36,8 @@ authenticated. Example:
   "defaultInputModes": ["data"],
   "defaultOutputModes": ["data"],
   "skills": [
-    { "id": "cfx3.manifest", "name": "Manifest", "description": "Context types + write capabilities." },
+    { "id": "cfx3.manifest", "name": "Manifest", "description": "Context types + the caller's level on each." },
+    { "id": "cfx3.permissions", "name": "Permissions", "description": "Caller subject + per-type access levels." },
     { "id": "cfx3.sync",     "name": "Sync",     "description": "Read context (full or incremental)." },
     { "id": "cfx3.write",    "name": "Write",    "description": "Create/update/delete context nodes." }
   ]
@@ -98,18 +99,83 @@ artifact:
 
 A client extracts the result by taking the first `data` part of the first artifact.
 
+On failure, the server returns a standard **JSON‑RPC error response** (A2A‑conformant)
+— `{ jsonrpc, id, error: { code, message, data } }` — whose `error.data` is an RFC 9457
+problem object. See §7.
+
 > Servers MAY run asynchronously and return `status.state: "working"` with later
 > `tasks/get`, per A2A. CF/x3 v1 servers **SHOULD** run synchronously and return
 > `completed`; clients **SHOULD** handle a `failed` state by surfacing
 > `status.message`.
 
-### 1.3 Authentication
+CF/x3 is a strict **profile of A2A**: it adds well‑known skills + JSON payloads and
+does not change A2A's discovery, `tasks/send` transport, task/artifact result shape,
+or JSON‑RPC error envelope. An A2A‑conformant client/agent can speak CF/x3.
 
-The agent card's `authentication.schemes` lists accepted schemes. v1 defines
-`"bearer"`: the client sends `Authorization: Bearer <api-key>`. A server **MAY**
-require auth on all skills and **MUST** reject unauthorized calls with the
-transport's standard 401, or a JSON‑RPC error (§7). Servers **SHOULD** scope what
-a credential can see and do (see capabilities, §4.3, and per‑type filtering, §4.2).
+### 1.3 Authentication & authorization
+
+**Credential:** CF/x3 uses **OAuth 2.0 Bearer tokens**
+([RFC 6750](https://www.rfc-editor.org/rfc/rfc6750)). The agent card's
+`authentication.schemes` lists `"bearer"`. The client sends
+`Authorization: Bearer <token>` on **every** POST. The token MAY be an opaque API
+key or a JWT — CF/x3 does not care, as long as the server can resolve it to a
+**principal** and that principal's **per‑type permission levels**.
+
+- A server **MUST** reject a missing/invalid token with an RFC 9457 **401
+  `unauthenticated`** problem (§7) and SHOULD include `WWW-Authenticate: Bearer`.
+  **Every** skill — including `cfx3.manifest` — requires a valid token; there is no
+  anonymous access.
+- A server **MUST** reject an authenticated caller that lacks the required level for
+  an operation with a **403 `insufficient-permission`** problem (§7).
+
+All errors are returned as RFC 9457 Problem Details (§7).
+
+**Permissions are graded per‑type levels.** Each context type has, for a given
+caller, exactly **one** access level. Levels are an ordered ladder — each builds on
+the previous (if you can `create` you can also `update` and `read`; if you can
+`delete` you can also `create`, etc.):
+
+| Level | Name | Grants (cumulative) |
+|------:|------|---------------------|
+| `0` | `none` | no access — the type is hidden from this caller |
+| `1` | `read` | read nodes of the type (`cfx3.sync`) |
+| `2` | `update` | + update existing nodes (`cfx3.write` `node.update`) |
+| `3` | `create` | + create new nodes (`cfx3.write` `node.create`) |
+| `4` | `delete` | + delete nodes (`cfx3.write` `node.delete`) |
+
+A caller with level `L` on a type MAY perform any operation whose **required level**
+is `≤ L`. Required levels per operation:
+
+| Operation | Required level |
+|-----------|---------------:|
+| `cfx3.sync` read of a type | `1` (read) |
+| `cfx3.write` `node.update` | `2` (update) |
+| `cfx3.write` `node.create` | `3` (create) |
+| `cfx3.write` `node.delete` | `4` (delete) |
+
+So one type may be read‑only (level 1), another read+update (2), another up to
+delete (4), and another invisible (0). Different callers MAY have different levels on
+the same type. **Type management** (creating/deleting context *types*, not nodes) is a
+separate source‑level capability, `manageTypes` (§3.3) — most sources have
+code‑defined types and set it false.
+
+Servers map their internal roles/ACLs to these levels per request. Clients learn the
+caller's level per type from the manifest (§4) and from `cfx3.permissions` (§4.5).
+
+### 1.4 Sessionless
+
+CF/x3 is **stateless / sessionless**. There is no login, handshake, cookie, or
+server‑side session. Conformant implementations **MUST**:
+
+- Authenticate and authorize **every request independently** from its bearer token —
+  the server derives the principal and per‑type levels per call and keeps no session.
+- Keep the **sync cursor client‑owned** (§5): the server does not remember a client's
+  position; the client sends `since` and stores the returned `syncedAt`.
+- Make each `tasks/send` self‑contained: a request's outcome **MUST NOT** depend on
+  prior requests from the same caller (other than durable context state itself).
+
+This makes CF/x3 horizontally scalable and replayable: any server instance can
+serve any request, and a client can resume from its stored cursor at any time.
 
 ---
 
@@ -117,13 +183,15 @@ a credential can see and do (see capabilities, §4.3, and per‑type filtering, 
 
 | Skill | Purpose | Read/Write |
 |-------|---------|------------|
-| `cfx3.manifest` | Declare the context types the source exposes + write capabilities | read |
+| `cfx3.manifest` | Declare the context types the caller may access + the caller's level on each | read |
+| `cfx3.permissions` | Report the **calling principal's** identity + per‑type access levels | read |
 | `cfx3.sync` | Transfer context records (full or incremental) | read |
 | `cfx3.write` | Create / update / delete context nodes (and, where allowed, types) | write |
 
-A server **MUST** implement `cfx3.manifest` and `cfx3.sync`. `cfx3.write` is
-**OPTIONAL**; a read‑only source advertises no write capabilities (§4.3) and MAY
-reject `cfx3.write`.
+**All four skills require a valid bearer token** (§1.3) — including `cfx3.manifest`.
+A server **MUST** implement `cfx3.manifest`, `cfx3.permissions`, and `cfx3.sync`.
+`cfx3.write` is **OPTIONAL**; a read‑only source grants no level ≥ 2 and MAY reject
+`cfx3.write`.
 
 ---
 
@@ -169,7 +237,9 @@ interface Cfx3TypeDef {
   description?: string;
   baseCategory?: string; // optional ontology hint: person|place|thing|event|task|goal
   fields?: Cfx3FieldDef[];
-  readonly?: boolean;    // true ⇒ nodes of this type cannot be created/updated/deleted
+  level?: number;        // in MANIFEST responses: the caller's access level for this
+                         // type, 0–4 (none|read|update|create|delete). Types at level 0
+                         // are omitted from the manifest entirely.
 }
 
 interface Cfx3FieldDef {
@@ -185,18 +255,23 @@ interface Cfx3FieldDef {
 `baseCategory` is an optional hint to help consumers slot the type into their own
 ontology; consumers MAY ignore it.
 
-### 3.3 Capabilities — `Cfx3Capabilities`
+### 3.3 Permissions — `Cfx3Permissions`
 
-What write operations the **caller** may perform (after the server applies the
-caller's permissions). See §4.3.
+The calling principal's identity and per‑type access levels — returned by
+[`cfx3.permissions`](#45-cfx3permissions--caller-permissions). Derived per request
+from the bearer token (sessionless).
 
 ```ts
-interface Cfx3Capabilities {
-  writeNodes: boolean;   // node.create / node.update allowed
-  deleteNodes: boolean;  // node.delete allowed
-  manageTypes: boolean;  // type.create / type.update / type.delete allowed
+type Cfx3Level = 0 | 1 | 2 | 3 | 4;   // none | read | update | create | delete (cumulative)
+
+interface Cfx3Permissions {
+  subject: string;                    // stable, opaque id of the calling principal (OAuth `sub`)
+  manageTypes: boolean;               // may create/update/delete context TYPES
+  types: Record<string, Cfx3Level>;   // type name → the caller's level (0–4)
 }
 ```
+
+A `types` entry of `0` (or an absent entry) means no access to that type.
 
 ### 3.4 Manifest — `Cfx3Manifest`
 
@@ -205,11 +280,15 @@ interface Cfx3Manifest {
   cfx3_version: number;          // protocol version (1)
   source: string;               // stable source id, e.g. "synaptic"
   name: string;                 // display name
-  context_types: Cfx3TypeDef[];
-  capabilities: Cfx3Capabilities;
+  context_types: Cfx3TypeDef[];  // only types the caller can read (level ≥ 1), each with `level`
+  manageTypes: boolean;          // whether the caller may manage context types
   auth: { schemes: ("bearer")[] };
 }
 ```
+
+The manifest is **permission‑scoped to the caller**: it lists only types the caller
+may read (level ≥ 1) and annotates each with the caller's `level`. `cfx3.permissions`
+returns the same per‑type levels in a compact map (§4.5).
 
 ---
 
@@ -221,24 +300,48 @@ Returns the source's [`Cfx3Manifest`](#34-manifest--cfx3manifest).
 
 **Result:** the manifest object.
 
-### 4.1 Purpose
+### 4.1 Purpose & protection
 
-The manifest is the source of truth for *what context exists* and *what the caller
-may do*. A client **SHOULD** fetch it before its first sync and refresh it
-periodically (e.g. daily) or on demand. A client **SHOULD** ensure its local store
-has matching context types before ingesting (creating them from `context_types`).
+The manifest tells the caller *what context it can see* and *at what level*. It is
+**protected**: the server **MUST** require a valid bearer token (401 otherwise) and
+**MUST** return only the types the caller may read. A client **SHOULD** fetch it
+before its first sync and refresh it periodically (e.g. daily) or on demand, and
+**SHOULD** ensure its local store has matching context types before ingesting.
 
-### 4.2 Permission filtering
+### 4.2 Permission scoping
 
-The manifest **SHOULD** reflect the caller's permissions: a server **SHOULD** omit
-context types the caller cannot read, and set `readonly: true` on types the caller
-cannot write.
+A server **MUST** omit any context type the caller cannot read (level 0), and
+**MUST** annotate each returned type with the caller's `level` (1–4). The client uses
+`level` to decide which operations to offer for that type:
 
-### 4.3 Capabilities
+| `level` | sync (read) | update | create | delete |
+|--------:|:-----------:|:------:|:------:|:------:|
+| 1 read | ✓ | | | |
+| 2 update | ✓ | ✓ | | |
+| 3 create | ✓ | ✓ | ✓ | |
+| 4 delete | ✓ | ✓ | ✓ | ✓ |
 
-`capabilities` declares the caller's allowed write operations *for this source as a
-whole*; per‑type `readonly` narrows it further. Clients **SHOULD** use these to
-decide whether to offer write/delete affordances.
+---
+
+## 4.5 `cfx3.permissions` — caller permissions
+
+Returns the **calling principal's** access levels, derived per request from the
+bearer token (sessionless). This is how a client learns who it is and what it may do
+across all types in one call.
+
+**Request payload:** *(none)* — `{ "skill": "cfx3.permissions" }`.
+
+**Result:** a [`Cfx3Permissions`](#33-permissions--cfx3permissions) object.
+
+- `subject` is a stable, opaque id for the principal (the OAuth `sub`); useful for
+  attributing writes and for the client to detect a credential change.
+- `manageTypes` indicates whether the caller may create/update/delete context types.
+- `types` maps each type name to the caller's level (0–4). It is the authoritative,
+  compact form of the same per‑type levels the manifest annotates.
+
+A server **MUST** compute this from the request's token only (no session). A client
+**SHOULD** call it on connect and after a manifest refresh, and use it to gate
+write/delete affordances.
 
 ---
 
@@ -327,32 +430,34 @@ interface Cfx3WriteRequest {
 }
 ```
 
-**Result — `Cfx3WriteResult`:**
+**Result — `Cfx3WriteResult`** (on success). Failures are returned as RFC 9457
+problems (§7), not as this shape.
 
 ```ts
 interface Cfx3WriteResult {
-  ok: boolean;
-  uid?: string;     // uid of the created/updated node
-  message?: string; // failure reason when ok=false
+  ok: true;
+  uid: string;      // uid of the created/updated node (for delete: the deleted uid)
 }
 ```
 
 ### 6.1 Operation semantics
 
 - **`node.create`** — `node.type` and `node.title` **MUST** be present. The server
-  assigns the `uid` and returns it. The server validates `fields` against the type.
+  assigns the `uid` and returns it. The server validates `fields` against the type
+  (a violation is a `422` problem, §7).
 - **`node.update`** — `node.uid` **MUST** be present; provided fields are merged.
 - **`node.delete`** — `uid` **MUST** be present.
 - **`type.create` / `type.update`** — supply a `Cfx3TypeDef` in `type`. Allowed only
-  when `capabilities.manageTypes` is true; many sources have code‑defined types and
-  return `ok: false`.
+  when `manageTypes` is true; many sources have code‑defined types and reject these.
 - **`type.delete`** — `typeName` **MUST** be present; same capability rule.
 
 ### 6.2 Permissions
 
-The server **MUST** enforce write permission server‑side regardless of what the
-manifest advertised. A rejected write returns `ok: false` with a `message` (the
-transport status MAY remain 200; surface the reason from `message`).
+The server **MUST** enforce the operation's **required level** server‑side
+(`node.update` ≥ 2, `node.create` ≥ 3, `node.delete` ≥ 4; type ops require
+`manageTypes`), regardless of what any cached manifest advertised. A write the caller
+lacks the level for returns an `insufficient-permission` problem (status 403),
+delivered as a JSON‑RPC error per §7.
 
 ### 6.3 Idempotency note for write‑back
 
@@ -362,28 +467,78 @@ the source updates in place rather than creating a duplicate.
 
 ---
 
-## 7. Errors
+## 7. Errors — RFC 9457 Problem Details, carried in A2A JSON‑RPC
 
-CF/x3 uses JSON‑RPC error objects for transport/dispatch problems, and the
-`ok/message` field for write‑level rejections.
+CF/x3 stays **fully A2A**: errors are returned as **JSON‑RPC 2.0 error responses**
+(the A2A envelope). The error body follows **RFC 9457** *Problem Details for HTTP
+APIs* ([RFC 9457](https://www.rfc-editor.org/rfc/rfc9457)) by carrying a problem
+object in the JSON‑RPC **`error.data`** member. This gives a standard, machine‑
+readable error format without leaving A2A/JSON‑RPC.
+
+On error the server returns:
 
 ```json
-{ "jsonrpc": "2.0", "id": "<id>", "error": { "code": -32602, "message": "Unknown CF/x3 skill: …" } }
+{
+  "jsonrpc": "2.0",
+  "id": "<request id>",
+  "error": {
+    "code": -32040,
+    "message": "Insufficient permission",
+    "data": {
+      "type": "https://cfx3.dev/problems/insufficient-permission",
+      "title": "Insufficient permission",
+      "status": 403,
+      "detail": "Level 1 (read) cannot create 'company' (requires 3).",
+      "instance": "urn:cfx3:req:7af3",
+      "contextType": "company", "requiredLevel": 3, "yourLevel": 1
+    }
+  }
+}
 ```
 
-Recommended codes:
+- `error.data` **MUST** be an RFC 9457 problem object: `type` (URI), `title`,
+  `status`, optional `detail`/`instance`, plus extension members. Clients **SHOULD**
+  branch on `data.type`, not on text.
+- `error.code` is the JSON‑RPC code (below); `error.message` mirrors `data.title`.
+- `data.status` carries the HTTP‑equivalent status (401/403/404/422/500).
 
-| Code | Meaning |
-|------|---------|
-| `-32700` | Parse error (malformed JSON) |
-| `-32600` | Invalid request (missing method) |
-| `-32601` | Unsupported method (only `tasks/send`) |
-| `-32602` | Invalid params / unknown skill |
-| `-32000` | Server error while executing a skill |
+### 7.1 HTTP status
 
-Auth failures **SHOULD** use the transport 401. A `cfx3.write` that is understood
-but not permitted **SHOULD** return `result.artifacts[0].data = { ok: false,
-message }` rather than a JSON‑RPC error.
+JSON‑RPC over HTTP normally returns **HTTP 200** with the error in the body, and CF/x3
+follows that for in‑band errors. The one exception A2A permits is **authentication**:
+a server **MAY** reject a missing/invalid token at the HTTP layer with **401** +
+`WWW-Authenticate: Bearer` (body SHOULD still be the JSON‑RPC error with the
+`unauthenticated` problem). Either way, clients learn the precise cause from
+`error.data.type` / `data.status`.
+
+### 7.2 Code ↔ problem registry (DRAFT)
+
+`type` URIs are under `https://cfx3.dev/problems/` (canonical registry; treat as
+opaque identifiers). CF/x3 uses standard JSON‑RPC codes for envelope problems and the
+application code **`-32040`** for semantic ones (chosen to avoid colliding with A2A's
+own task error codes, e.g. `TaskNotFound -32001`).
+
+| JSON‑RPC `code` | problem `type` (slug) | `status` | When | Extensions |
+|----------------:|-----------------------|---------:|------|------------|
+| `-32700` | `invalid-request` | 400 | malformed JSON | |
+| `-32600` | `invalid-request` | 400 | missing/invalid request | |
+| `-32601` | `invalid-request` | 400 | method ≠ `tasks/send` | |
+| `-32602` | `unknown-skill` | 400 | unknown `data.skill` / bad params | `skill` |
+| `-32040` | `unauthenticated` | 401 | missing/invalid/expired token | |
+| `-32040` | `insufficient-permission` | 403 | caller's level too low | `contextType`, `requiredLevel`, `yourLevel` |
+| `-32040` | `type-management-unsupported` | 403 | `type.*` when `manageTypes` false | |
+| `-32040` | `not-found` | 404 | unknown `uid`/type on update/delete | `uid` |
+| `-32040` | `unprocessable` | 422 | field/type validation failed | `errors` (per‑field) |
+| `-32603` | `server-error` | 500 | unexpected failure | |
+
+Unspecified errors **SHOULD** use `type: "about:blank"` with an appropriate `status`.
+
+### 7.3 Client handling
+
+Clients read the JSON‑RPC `error`, then `error.data`: branch on `data.type` (refresh
+the token on `unauthenticated`, hide an affordance on `insufficient-permission`,
+surface `detail`), falling back to `error.code`/`error.message` if `data` is absent.
+Also honor a transport‑level **401** for auth.
 
 ---
 
@@ -431,19 +586,34 @@ Result (artifact data):
   "source": "synaptic",
   "name": "Synaptic",
   "context_types": [
-    { "name": "company", "plural": "companies", "baseCategory": "place",
+    { "name": "company", "plural": "companies", "baseCategory": "place", "level": 4,
       "fields": [ { "key": "domain", "type": "string" }, { "key": "industry", "type": "string" } ] },
-    { "name": "contact", "plural": "contacts", "baseCategory": "person",
+    { "name": "contact", "plural": "contacts", "baseCategory": "person", "level": 2,
       "fields": [ { "key": "email", "type": "string" }, { "key": "role", "type": "string" } ] },
-    { "name": "account", "plural": "accounts", "baseCategory": "thing", "readonly": true,
+    { "name": "account", "plural": "accounts", "baseCategory": "thing", "level": 1,
       "fields": [ { "key": "code", "type": "string" } ] }
   ],
-  "capabilities": { "writeNodes": true, "deleteNodes": false, "manageTypes": false },
+  "manageTypes": false,
   "auth": { "schemes": ["bearer"] }
 }
 ```
 
-### 10.2 Sync (incremental)
+Here the caller may delete companies (4), update contacts (2), and only read accounts
+(1). Any type they can't read (level 0) is absent.
+
+### 10.2 Permissions (who am I)
+
+Request: `{ "skill": "cfx3.permissions" }`. Result (artifact data):
+
+```json
+{
+  "subject": "user_8f3a",
+  "manageTypes": false,
+  "types": { "company": 4, "contact": 2, "account": 1, "deal": 0 }
+}
+```
+
+### 10.3 Sync (incremental)
 
 Request:
 
@@ -475,7 +645,7 @@ Result (artifact data):
 The client upserts both records keyed on `(synaptic, uid)`, trashes the tombstoned
 node, and stores `2026-06-26T18:10:42.000Z` as the next `since`.
 
-### 10.3 Write (create a context node)
+### 10.4 Write (create a context node)
 
 Request:
 
@@ -494,16 +664,22 @@ Request:
     } } ] } } }
 ```
 
-Result (artifact data):
+Result — HTTP 200, JSON‑RPC result whose artifact data is:
 
 ```json
 { "ok": true, "uid": "crm/contact/CT9k2p1" }
 ```
 
-A rejected write:
+A rejected write — a JSON‑RPC **error** response carrying an RFC 9457 problem (§7):
 
 ```json
-{ "ok": false, "message": "forbidden: write permission required" }
+{ "jsonrpc": "2.0", "id": "3",
+  "error": { "code": -32040, "message": "Insufficient permission",
+    "data": {
+      "type": "https://cfx3.dev/problems/insufficient-permission",
+      "title": "Insufficient permission", "status": 403,
+      "detail": "Level 1 (read) cannot create 'contact' (requires 3).",
+      "contextType": "contact", "requiredLevel": 3, "yourLevel": 1 } } }
 ```
 
 ---
@@ -511,16 +687,25 @@ A rejected write:
 ## 11. Conformance checklist
 
 **Server**
-- [ ] `GET /.well-known/agent.json` returns a card with the three skills + `auth`.
-- [ ] `POST {url}` handles JSON‑RPC `tasks/send`; routes on `data.skill`.
-- [ ] `cfx3.manifest` returns a permission‑filtered manifest with `cfx3_version`.
+- [ ] `GET /.well-known/agent.json` returns a card with the four skills + `auth`.
+- [ ] `POST {url}` handles JSON‑RPC `tasks/send`; routes on `data.skill`; results are
+      A2A tasks with a `data` artifact (stays A2A‑conformant).
+- [ ] Authenticates the **bearer token per request** (sessionless), on **every**
+      skill including `cfx3.manifest`.
+- [ ] Maps internal roles → a **per‑type level (0–4)**; enforces the op's required level.
+- [ ] `cfx3.manifest` returns only types with level ≥ 1, each annotated with `level`.
+- [ ] `cfx3.permissions` returns the caller's `subject`, `manageTypes`, and `types` level map.
 - [ ] `cfx3.sync` supports full (`since:null`) and incremental; returns `records`,
-      `tombstones`, `syncedAt`.
-- [ ] (If writable) `cfx3.write` enforces permissions and returns `{ ok, uid?, message? }`.
-- [ ] Returns JSON‑RPC errors per §7; 401 on auth failure.
+      `tombstones`, `syncedAt`; keeps **no cursor state**.
+- [ ] (If writable) `cfx3.write` returns `{ ok:true, uid }` on success.
+- [ ] **Errors** are JSON‑RPC error responses with an **RFC 9457** problem in
+      `error.data` (§7); auth MAY also use transport 401.
 
 **Client**
-- [ ] Fetches + caches the manifest; ensures local context types exist.
+- [ ] Sends `Authorization: Bearer` on every call; assumes no session.
+- [ ] Fetches + caches the manifest and `cfx3.permissions`; ensures local types exist.
+- [ ] Gates each operation on the type's `level` (read ≥1, update ≥2, create ≥3, delete ≥4).
 - [ ] Sends `since` cursor; persists returned `syncedAt`; supports paging.
 - [ ] Upserts keyed on `(source, uid)`; records provenance; applies tombstones.
+- [ ] Handles errors by branching on `error.data.type` (RFC 9457); honors 401.
 - [ ] (If writing back) uses `node.update` with the stored `uid` for existing nodes.

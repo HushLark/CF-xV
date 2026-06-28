@@ -33,9 +33,17 @@ from these docs alone.**
 
 - **Transport:** A2A — `GET /.well-known/agent.json` for discovery, JSON‑RPC 2.0
   `tasks/send` to a single POST endpoint, results returned as task *artifacts*.
-- **Auth:** `Authorization: Bearer <api-key>` on the POST (servers MAY require it).
-- **Three skills:**
-  - `cfx3.manifest` — the context types the source exposes + write capabilities.
+- **Auth:** OAuth 2.0 **Bearer** token (RFC 6750) on every request. Every skill —
+  including the manifest — requires a valid token.
+- **Permissions:** a **graded per‑type level** — `0 none · 1 read · 2 update ·
+  3 create · 4 delete`, each building on the previous. A caller may have a different
+  level on each context type; the server maps its RBAC to levels.
+- **Sessionless:** no login/handshake/session — every request is authenticated and
+  authorized from its bearer token, and the sync cursor is client‑owned.
+- **Four skills:**
+  - `cfx3.manifest` — the context types the caller may read + the caller's level on each.
+  - `cfx3.permissions` — the **calling principal's** subject + per‑type level map
+    (the "who am I / what can I do" call).
   - `cfx3.sync` — **read** context; full (`since: null`) or incremental (`since: <ISO>`).
   - `cfx3.write` — **create / update / delete** context nodes (and, where allowed, types).
 - **Idempotent mirroring:** every node has a stable `uid`; clients upsert keyed on

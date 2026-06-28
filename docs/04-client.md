@@ -35,17 +35,49 @@ function cfx3Call(source, skill, payload):
              params:{ message:{ role:"user", parts:[ { type:"data", data:{ skill, ...payload } } ] } } }
     res  = httpPost(source.url, headers={ "Content-Type":"application/json",
                                           "Authorization":"Bearer "+source.apiKey }, body)
+    if res.status == 401: throw Cfx3Problem({ type:".../unauthenticated", status:401 })
     json = res.body
-    if json.error: throw json.error.message
+    if json.error:                                  # A2A JSON-RPC error; data = RFC 9457 problem
+        throw Cfx3Problem(json.error.data or { title: json.error.message, status: 0 })
     task = json.result
     if task.status.state == "failed": throw task.status.message
     return firstDataPart(task.artifacts[0].parts).data     # the skill payload
 ```
 
+`Cfx3Problem` wraps the RFC 9457 problem so callers can branch on `problem.type`
+(e.g. `unauthenticated`, `insufficient-permission`) and show `problem.detail`.
+
 Discovery (optional): `GET {url}/.well-known/agent.json` to read the card before
 connecting; not required if you already know the endpoint.
 
-## 3. Manifest: fetch, cache, ensure types
+CF/x3 is **sessionless**: there is no login. Send `Authorization: Bearer <apiKey>`
+on **every** call; never assume the server remembers you between requests.
+
+## 3. Permissions: who am I, what can I do
+
+Permission is a **level 0–4 per context type** (`0 none · 1 read · 2 update ·
+3 create · 4 delete`, cumulative). Learn the caller's levels via `cfx3.permissions`;
+call it on connect and after a manifest refresh.
+
+```
+LEVEL = { none:0, read:1, update:2, create:3, delete:4 }
+
+function refreshPermissions(source):
+    p = cfx3Call(source, "cfx3.permissions", {})   # { subject, manageTypes, types: { <type>: 0..4 } }
+    source.permissions = p; save(source)
+    return p
+
+levelOf(source, type)   = source.permissions?.types?.[type] ?? 0
+canRead(source, type)   = levelOf(source, type) >= LEVEL.read    # 1
+canUpdate(source, type) = levelOf(source, type) >= LEVEL.update  # 2
+canCreate(source, type) = levelOf(source, type) >= LEVEL.create  # 3
+canDelete(source, type) = levelOf(source, type) >= LEVEL.delete  # 4
+```
+
+The manifest also annotates each type with the caller's `level`, so a client that
+only fetched the manifest already knows what it may do.
+
+## 4. Manifest: fetch, cache, ensure types
 
 ```
 function refreshManifest(source):
@@ -61,7 +93,7 @@ function refreshManifest(source):
   (name, fields, `baseCategory` hint), creating it if absent. Do this **before**
   ingesting nodes so they validate.
 
-## 4. Sync: read with a client‑owned cursor
+## 5. Sync: read with a client‑owned cursor
 
 ```
 function sync(source, opts):
@@ -82,7 +114,7 @@ function sync(source, opts):
 - Loop on `nextCursor` (same `since`) to drain pages, then store the final
   `syncedAt`.
 
-## 5. Ingest: idempotent upsert keyed on (source, uid)
+## 6. Ingest: idempotent upsert keyed on (source, uid)
 
 This is the heart of a client. Mirror each node into your store, **tagged with its
 origin**, updating in place on re‑sync.
@@ -119,7 +151,7 @@ Rules:
 4. **Deletes:** remove local nodes for tombstoned uids or `deleted:true` records.
 5. Apply your own store's validation/normalization on write.
 
-## 6. Write‑back (optional)
+## 7. Write‑back (optional)
 
 To push a change to the source:
 
@@ -135,26 +167,33 @@ cfx3Call(source, "cfx3.write", { op:"node.update",
 cfx3Call(source, "cfx3.write", { op:"node.delete", uid: node.sourceId })
 ```
 
-- Check `source.manifest.capabilities` (and the type's `readonly`) before offering
-  write/delete.
+- Check the caller's **level** for the type before offering an op (`canUpdate` ≥2,
+  `canCreate` ≥3, `canDelete` ≥4).
 - For an existing mirrored node, **update by its `sourceId`** so the source mutates
-  in place (no duplicate). Handle `{ ok:false, message }` gracefully.
+  in place (no duplicate).
+- A rejected write comes back as an RFC 9457 problem (e.g. 403
+  `insufficient-permission`); surface its `detail` (see §9).
 
-## 7. Scheduling & refresh
+## 8. Scheduling & refresh
 
 - Run `sync` on demand (a "Sync now" affordance) and/or on a schedule (e.g. hourly).
 - Refresh the manifest less often than you sync.
 - A reasonable cron loop: for each enabled source → refresh manifest if stale →
   incremental sync.
 
-## 8. Errors & resilience
+## 9. Errors & resilience
 
-- A `cfx3Call` may throw (HTTP error, JSON‑RPC error, failed task). Log and continue
-  to the next source; don't let one bad source block others.
+- Errors arrive as A2A **JSON‑RPC error** responses whose `error.data` is an
+  **RFC 9457** problem (spec §7). Branch on `problem.type`:
+  - `unauthenticated` (401) → the token is bad/expired; prompt to reconnect.
+  - `insufficient-permission` (403) → hide/disable the affordance; surface `detail`.
+  - `not-found` / `unprocessable` → surface `detail`; for `unprocessable`, show
+    `problem.errors` (per‑field).
+- Log and continue to the next source; don't let one bad source block others.
 - Time‑box network calls so a slow/offline source can't hang your sync loop.
 - Treat a version mismatch (`cfx3_version`) as a soft failure: skip or degrade.
 
-## 9. Minimal client checklist
+## 10. Minimal client checklist
 
 - [ ] Source registry with `url`, `apiKey`, `lastSyncAt` (key stored securely).
 - [ ] `cfx3Call` transport (POST `tasks/send`, extract first data artifact).
