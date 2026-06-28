@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/cfx3-logo.png" alt="CF/x3" width="420">
+</p>
+
 # CF/x3 — Context Federation Protocol
 
 > **⚠️ DRAFT.** This specification is a working draft and may change. Do not treat
